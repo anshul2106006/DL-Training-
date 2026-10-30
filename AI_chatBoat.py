@@ -1,117 +1,135 @@
-import streamlit as st
 import os
-import zipfile
-import shutil
-import tempfile
-from cnn_model import build_cnn
-from tensorflow.keras.preprocessing.image import ImageDataGenerator, load_img, img_to_array
-import matplotlib.pyplot as plt
-import numpy as np
-import tempfile
+import streamlit as st
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_ollama import OllamaLLM
 
-from tensorflow.keras.datasets import cifar10
-from tensorflow.keras.utils import to_categorical
+st.set_page_config(page_title="Robotics RAG", page_icon="🤖")
+st.title("🤖 Robotics RAG Assistant")
 
-st.set_page_config("📸 CNN Image Classifier", layout="wide")
-st.title("🧠 CNN with Built-In Dataset Loader")
+DOCS = "documents"
+DB = "vectorstore"
+os.makedirs(DOCS, exist_ok=True)
 
-# Sidebar
-st.sidebar.header("🔍 Choose Section")
-section = st.sidebar.radio("Go to:", ["Train Model", "Predict"])
+@st.cache_resource
+def models():
+    return (
+        HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        ),
+        OllamaLLM(model="gemma2:2b", temperature=0)
+    )
 
-# Session state to hold model
-if 'model' not in st.session_state:
-    st.session_state.model = None
-    st.session_state.img_size = 64
-    st.session_state.class_names = []
+def build_db():
+    docs = []
+    for f in os.listdir(DOCS):
+        path = os.path.join(DOCS, f)
+        if f.lower().endswith(".pdf"):
+            docs.extend(PyPDFLoader(path).load())
+        elif f.lower().endswith(".txt"):
+            docs.extend(TextLoader(path, encoding="utf-8").load())
 
-if section == "Train Model":
-    dataset_choice = st.sidebar.radio("Dataset:", ["CIFAR-10", "Cats vs Dogs (ZIP Upload)"])
-    img_size = st.sidebar.slider("Image Size", 32, 256, 64)
-    batch_size = st.sidebar.selectbox("Batch size", [16, 32, 64])
-    epochs = st.sidebar.slider("Epochs", 1, 20, 5)
+    if not docs:
+        raise ValueError("No PDF or TXT documents found!")
 
-    # CASE 1: CIFAR-10 Dataset
-    if dataset_choice == "CIFAR-10":
-        st.subheader("📦 CIFAR-10 Loaded")
-        (x_train, y_train), (x_test, y_test) = cifar10.load_data()
+    chunks = RecursiveCharacterTextSplitter(
+        chunk_size=700, chunk_overlap=120
+    ).split_documents(docs)
 
-        x_train, x_test = x_train / 255.0, x_test / 255.0
-        y_train_cat = to_categorical(y_train, 10)
-        y_test_cat = to_categorical(y_test, 10)
+    db = FAISS.from_documents(chunks, models()[0])
+    db.save_local(DB)
+    return db, len(chunks)
 
-        if st.button("🧠 Train CNN on CIFAR-10"):
-            model = build_cnn((32, 32, 3), 10)
-            history = model.fit(x_train, y_train_cat, validation_data=(x_test, y_test_cat), epochs=epochs)
+def answer_question(question, db):
+    results = db.similarity_search_with_relevance_scores(question, k=5)
+    results = [(d, s) for d, s in results if s >= 0.25]
 
-            st.session_state.model = model
-            st.session_state.img_size = 32
-            st.session_state.class_names = [str(i) for i in range(10)]
+    if not results:
+        return "Insufficient information in the provided documents.", []
 
-            st.success("✅ Training Complete!")
-            fig, ax = plt.subplots(1, 2)
-            ax[0].plot(history.history["accuracy"], label="Train Acc")
-            ax[0].plot(history.history["val_accuracy"], label="Val Acc")
-            ax[0].set_title("Accuracy"); ax[0].legend()
+    context = "\n\n".join(
+        f"Source: {os.path.basename(d.metadata.get('source', 'Unknown'))}, "
+        f"Page: {d.metadata.get('page', 0) + 1}\n{d.page_content}"
+        for d, s in results
+    )
 
-            ax[1].plot(history.history["loss"], label="Train Loss")
-            ax[1].plot(history.history["val_loss"], label="Val Loss")
-            ax[1].set_title("Loss"); ax[1].legend()
-            st.pyplot(fig)
+    prompt = f"""Answer using ONLY the document context below.
+If evidence is missing, say you cannot find sufficient information.
+If sources conflict, explain the conflict and cite both sources.
+Do not invent facts.
 
-    # CASE 2: Cats vs Dogs ZIP
+CONTEXT:
+{context}
+
+QUESTION: {question}
+ANSWER:"""
+
+    answer = models()[1].invoke(prompt)
+    sources = [
+        {
+            "file": os.path.basename(d.metadata.get("source", "Unknown")),
+            "page": d.metadata.get("page", 0) + 1,
+            "excerpt": d.page_content[:250]
+        }
+        for d, s in results
+    ]
+    return answer, sources
+
+with st.sidebar:
+    st.header("Knowledge Base")
+    files = st.file_uploader(
+        "Upload PDF/TXT files",
+        type=["pdf", "txt"],
+        accept_multiple_files=True
+    )
+
+    if st.button("Save Documents"):
+        if files:
+            for f in files:
+                with open(os.path.join(DOCS, os.path.basename(f.name)), "wb") as out:
+                    out.write(f.getbuffer())
+            st.success("Documents saved!")
+
+    if st.button("Build Knowledge Base"):
+        try:
+            with st.spinner("Indexing documents..."):
+                db, count = build_db()
+            st.session_state.db = db
+            st.success(f"Knowledge base ready! {count} chunks indexed.")
+        except Exception as e:
+            st.error(str(e))
+
+if "db" not in st.session_state and os.path.exists(
+    os.path.join(DB, "index.faiss")
+):
+    try:
+        st.session_state.db = FAISS.load_local(
+            DB, models()[0], allow_dangerous_deserialization=True
+        )
+    except Exception as e:
+        st.warning(f"Could not load index: {e}")
+
+question = st.chat_input("Ask a robotics question...")
+
+if question:
+    st.chat_message("user").write(question)
+
+    if "db" not in st.session_state:
+        st.warning("Upload documents and build the knowledge base first.")
     else:
-        st.subheader("🐱🐶 Upload Cats vs Dogs ZIP")
-        zip_file = st.file_uploader("Upload ZIP of dataset (foldered by class)", type=["zip"])
-        if zip_file:
-            temp_dir = tempfile.mkdtemp()
-            with zipfile.ZipFile(zip_file, 'r') as zip_ref:
-                zip_ref.extractall(temp_dir)
-            st.success("✅ Extracted!")
+        with st.chat_message("assistant"):
+            try:
+                with st.spinner("Finding answers..."):
+                    answer, sources = answer_question(
+                        question, st.session_state.db
+                    )
+                st.write(answer)
 
-            datagen = ImageDataGenerator(rescale=1./255, validation_split=0.2)
-            train_gen = datagen.flow_from_directory(
-                temp_dir, target_size=(img_size, img_size),
-                batch_size=batch_size, class_mode='categorical', subset='training'
-            )
-            val_gen = datagen.flow_from_directory(
-                temp_dir, target_size=(img_size, img_size),
-                batch_size=batch_size, class_mode='categorical', subset='validation'
-            )
-
-            if st.button("🧠 Train CNN on Uploaded Dataset"):
-                model = build_cnn((img_size, img_size, 3), train_gen.num_classes)
-                history = model.fit(train_gen, validation_data=val_gen, epochs=epochs)
-
-                st.session_state.model = model
-                st.session_state.img_size = img_size
-                st.session_state.class_names = list(train_gen.class_indices.keys())
-
-                st.success("🎯 Training Finished!")
-                fig, ax = plt.subplots(1, 2)
-                ax[0].plot(history.history["accuracy"], label="Train Acc")
-                ax[0].plot(history.history["val_accuracy"], label="Val Acc")
-                ax[0].set_title("Accuracy"); ax[0].legend()
-
-                ax[1].plot(history.history["loss"], label="Train Loss")
-                ax[1].plot(history.history["val_loss"], label="Val Loss")
-                ax[1].set_title("Loss"); ax[1].legend()
-                st.pyplot(fig)
-
-elif section == "Predict":
-    st.subheader("🔎 Predict Image Class")
-    uploaded_file = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
-    if uploaded_file and st.session_state.model is not None:
-        img = load_img(uploaded_file, target_size=(st.session_state.img_size, st.session_state.img_size))
-        st.image(img, caption="Uploaded Image", use_column_width=True)
-
-        img_array = img_to_array(img) / 255.0
-        img_array = np.expand_dims(img_array, axis=0)
-
-        pred = st.session_state.model.predict(img_array)
-        class_name = st.session_state.class_names[np.argmax(pred)]
-        confidence = np.max(pred) * 100
-
-        st.success(f"✅ Predicted: {class_name} ({confidence:.2f}% confidence)")
-    elif uploaded_file:
-        st.warning("⚠️ Please train a model first in the 'Train Model' tab.")
+                with st.expander("Supporting Sources"):
+                    for s in sources:
+                        st.markdown(f"**{s['file']} — Page {s['page']}**")
+                        st.caption(s["excerpt"])
+            except Exception as e:
+                st.error(f"Error: {e}")
